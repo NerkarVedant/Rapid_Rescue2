@@ -15,6 +15,7 @@
 //    not checked. Added type-safe guard.
 // ============================================================
 import { mqttClient } from './mqttClient';
+import { findNearestHospital, type HospitalRecord } from './hospitalRegistry';
 import type { GeoPoint, TrafficSignalPayload } from '../../../../shared/models/rctf';
 
 // ── Haversine distance (metres) ───────────────────────────────
@@ -56,10 +57,32 @@ const SIGNAL_REGISTRY = new Map<string, SignalRecord>([
 const CORRIDOR_RADIUS_METRES = 500;
 const GREEN_DURATION_SECONDS = 60;
 const RESTORE_DISTANCE_METRES = 600;  // Ambulance must pass this far before signal restores
+const ARRIVAL_RADIUS_METRES = 100;    // Ambulance considered "arrived" when within this range of scene
+
+// ── Ambulance Mission Tracking ────────────────────────────────
+// Tracks which phase each ambulance is in for a given accident:
+//   TO_SCENE    → Driving to the accident location
+//   AT_SCENE    → Arrived at accident, picking up victim
+//   TO_HOSPITAL → Driving to nearest hospital
+//   AT_HOSPITAL → Arrived at hospital (mission complete)
+export type AmbulancePhase = 'TO_SCENE' | 'AT_SCENE' | 'TO_HOSPITAL' | 'AT_HOSPITAL';
+
+export interface AmbulanceMission {
+    accidentId: string;
+    entityId: string;
+    phase: AmbulancePhase;
+    sceneLocation: GeoPoint;
+    hospital?: HospitalRecord & { distanceKm: number };
+    hospitalLocation?: GeoPoint;
+    arrivedAtSceneAt?: string;
+    arrivedAtHospitalAt?: string;
+}
 
 class CorridorEngine {
     // Track which signals are active per accident
     private activeCorridors = new Map<string, Set<string>>();
+    // Track ambulance missions (accidentId → mission)
+    private missions = new Map<string, AmbulanceMission>();
 
     processAmbulanceUpdate(data: {
         payload?: { accidentId?: string; location?: GeoPoint; entityId?: string };
@@ -68,16 +91,171 @@ class CorridorEngine {
     }): void {
         const accidentId = data.payload?.accidentId ?? data.accidentId;
         const location = data.payload?.location ?? data.location;
+        const entityId = data.payload?.entityId ?? 'UNKNOWN';
 
         if (!accidentId || !location) return;
         if (typeof location.lat !== 'number' || typeof location.lng !== 'number') return;
 
+        // ── Mission phase management ──────────────────────────
+        let mission = this.missions.get(accidentId);
+
+        if (!mission) {
+            // First location update for this accident — ambulance is heading to scene
+            // The scene location comes from the initial SOS (stored when corridor was init'd)
+            mission = {
+                accidentId,
+                entityId,
+                phase: 'TO_SCENE',
+                sceneLocation: this.sceneLocations.get(accidentId) ?? location,
+            };
+            this.missions.set(accidentId, mission);
+            console.log(`[corridor-service] Mission started for ${accidentId}: TO_SCENE`);
+        }
+
+        // ── Phase transitions ─────────────────────────────────
+        if (mission.phase === 'TO_SCENE') {
+            // Check if ambulance has arrived at the accident scene
+            const distToScene = haversineMetres(location, mission.sceneLocation);
+            if (distToScene <= ARRIVAL_RADIUS_METRES) {
+                this.transitionToAtScene(mission, location);
+            }
+        } else if (mission.phase === 'AT_SCENE') {
+            // Ambulance is at scene — waiting for victim pickup.
+            // Transition to TO_HOSPITAL happens via API call or automatically.
+            // For now, check if ambulance has started moving away from scene toward hospital.
+            if (mission.hospitalLocation) {
+                const distFromScene = haversineMetres(location, mission.sceneLocation);
+                if (distFromScene > ARRIVAL_RADIUS_METRES * 2) {
+                    mission.phase = 'TO_HOSPITAL';
+                    console.log(`[corridor-service] ${accidentId}: Ambulance moving → TO_HOSPITAL (${mission.hospital?.name})`);
+                    this.publishMissionUpdate(mission);
+                }
+            }
+        } else if (mission.phase === 'TO_HOSPITAL' && mission.hospitalLocation) {
+            // Check if ambulance has arrived at the hospital
+            const distToHospital = haversineMetres(location, mission.hospitalLocation);
+            if (distToHospital <= ARRIVAL_RADIUS_METRES) {
+                mission.phase = 'AT_HOSPITAL';
+                mission.arrivedAtHospitalAt = new Date().toISOString();
+                console.log(`[corridor-service] ${accidentId}: Ambulance ARRIVED at hospital ${mission.hospital?.name}`);
+                this.publishMissionUpdate(mission);
+
+                // Release the corridor — mission complete
+                this.releaseCorridorForAccident(accidentId);
+                return;
+            }
+        }
+
+        // ── Green corridor signal management ──────────────────
         const nearbySignals = this.findSignalsWithinRadius(location, CORRIDOR_RADIUS_METRES);
         for (const signal of nearbySignals) {
             this.flipGreen(signal, accidentId);
         }
 
         this.checkAndRestorePassedSignals(accidentId, location);
+    }
+
+    // ── Scene location storage (set during corridor init) ─────
+    private sceneLocations = new Map<string, GeoPoint>();
+
+    setSceneLocation(accidentId: string, location: GeoPoint): void {
+        this.sceneLocations.set(accidentId, location);
+    }
+
+    // ── Transition: TO_SCENE → AT_SCENE ───────────────────────
+    private transitionToAtScene(mission: AmbulanceMission, currentLocation: GeoPoint): void {
+        mission.phase = 'AT_SCENE';
+        mission.arrivedAtSceneAt = new Date().toISOString();
+        console.log(`[corridor-service] ${mission.accidentId}: Ambulance ARRIVED at scene`);
+
+        // Find the nearest hospital and set it as destination
+        const nearestHospitals = findNearestHospital(currentLocation, { limit: 1 });
+        if (nearestHospitals.length > 0) {
+            const hospital = nearestHospitals[0];
+            mission.hospital = hospital;
+            mission.hospitalLocation = hospital.location;
+            console.log(
+                `[corridor-service] ${mission.accidentId}: Nearest hospital → ${hospital.name} ` +
+                `(${hospital.distanceKm.toFixed(2)} km) — corridor will re-route on departure`
+            );
+        } else {
+            console.warn(`[corridor-service] ${mission.accidentId}: No available hospital found!`);
+        }
+
+        this.publishMissionUpdate(mission);
+    }
+
+    // ── Manually trigger hospital routing (API-driven) ────────
+    startHospitalRouting(accidentId: string, hospitalId?: string): AmbulanceMission | null {
+        const mission = this.missions.get(accidentId);
+        if (!mission) return null;
+
+        if (hospitalId) {
+            // Use a specific hospital
+            const { getHospital } = require('./hospitalRegistry');
+            const hospital = getHospital(hospitalId);
+            if (hospital) {
+                mission.hospital = { ...hospital, distanceKm: 0 };
+                mission.hospitalLocation = hospital.location;
+            }
+        } else if (!mission.hospital) {
+            // Auto-find nearest hospital from accident scene
+            const nearestHospitals = findNearestHospital(mission.sceneLocation, { limit: 1 });
+            if (nearestHospitals.length > 0) {
+                mission.hospital = nearestHospitals[0];
+                mission.hospitalLocation = nearestHospitals[0].location;
+            }
+        }
+
+        if (mission.hospital) {
+            mission.phase = 'TO_HOSPITAL';
+            console.log(`[corridor-service] ${accidentId}: Hospital routing started → ${mission.hospital.name}`);
+            this.publishMissionUpdate(mission);
+        }
+
+        return mission;
+    }
+
+    // ── Publish mission update via MQTT ────────────────────────
+    private publishMissionUpdate(mission: AmbulanceMission): void {
+        const missionPayload = {
+            accidentId: mission.accidentId,
+            entityId: mission.entityId,
+            phase: mission.phase,
+            sceneLocation: mission.sceneLocation,
+            hospital: mission.hospital ? {
+                hospitalId: mission.hospital.hospitalId,
+                name: mission.hospital.name,
+                location: mission.hospital.location,
+                phone: mission.hospital.phone,
+                distanceKm: mission.hospital.distanceKm,
+                mapLink: `https://www.google.com/maps?q=${mission.hospital.location.lat},${mission.hospital.location.lng}`,
+            } : null,
+            arrivedAtSceneAt: mission.arrivedAtSceneAt,
+            arrivedAtHospitalAt: mission.arrivedAtHospitalAt,
+        };
+
+        mqttClient.publish(
+            `rescuedge/mission/${mission.accidentId}/update`,
+            JSON.stringify(missionPayload),
+            { qos: 1 }
+        );
+
+        // Also notify via the corridor channel for dashboard consumption
+        mqttClient.publish(
+            `rescuedge/corridor/${mission.accidentId}/mission`,
+            JSON.stringify(missionPayload),
+            { qos: 1 }
+        );
+    }
+
+    // ── Get mission status ────────────────────────────────────
+    getMission(accidentId: string): AmbulanceMission | undefined {
+        return this.missions.get(accidentId);
+    }
+
+    getAllMissions(): AmbulanceMission[] {
+        return Array.from(this.missions.values());
     }
 
     private findSignalsWithinRadius(center: GeoPoint, radiusMetres: number): SignalRecord[] {
@@ -222,18 +400,20 @@ class CorridorEngine {
     /** Call when an accident is resolved to clean up corridor state. */
     releaseCorridorForAccident(accidentId: string): void {
         const signals = this.activeCorridors.get(accidentId);
-        if (!signals) return;
-
-        for (const signalId of signals) {
-            const signal = SIGNAL_REGISTRY.get(signalId);
-            if (signal?.corridorActive && signal.accidentId === accidentId) {
-                if (signal.restoreTimer) clearTimeout(signal.restoreTimer);
-                this.restoreSignal(signal, accidentId);
+        if (signals) {
+            for (const signalId of signals) {
+                const signal = SIGNAL_REGISTRY.get(signalId);
+                if (signal?.corridorActive && signal.accidentId === accidentId) {
+                    if (signal.restoreTimer) clearTimeout(signal.restoreTimer);
+                    this.restoreSignal(signal, accidentId);
+                }
             }
         }
 
         this.activeCorridors.delete(accidentId);
-        console.log(`[corridor-service] Corridor released for ${accidentId}`);
+        this.missions.delete(accidentId);
+        this.sceneLocations.delete(accidentId);
+        console.log(`[corridor-service] Corridor & mission released for ${accidentId}`);
     }
 }
 

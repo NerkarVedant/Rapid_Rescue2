@@ -63,7 +63,7 @@ export async function sendEmergencySMS(
     accidentId: string,
     location: { lat: number; lng: number }
 ): Promise<void> {
-    const mapsLink = `https://maps.google.com/?q=${location.lat},${location.lng}`;
+    const mapsLink = `https://www.google.com/maps?q=${location.lat},${location.lng}`;
 
     // Fallback to localhost only in development
     const dashboardHost = process.env.PUBLIC_URL || (process.env.NODE_ENV === 'development' ? 'http://localhost:3000' : '');
@@ -77,11 +77,41 @@ export async function sendEmergencySMS(
         `🚨 EMERGENCY ALERT — RescuEdge`,
         `Your contact has been in an accident.`,
         `Case ID: ${accidentId}`,
-        `Live Location: ${mapsLink}`,
+        `📍 Accident Location: ${mapsLink}`,
         `Live Audio/Video: ${broadcastUrl}`,
         `Emergency services are enroute. Stay calm.`,
     ].join('\n');
 
     // Basic async orchestration
+    await Promise.allSettled(contacts.map((contact) => sendSMS(contact, body)));
+}
+
+/**
+ * Send SMS notification when ambulance is routing to hospital.
+ * Includes a clickable Google Maps link to the hospital location.
+ */
+export async function sendHospitalRoutingSMS(
+    contacts: string[],
+    accidentId: string,
+    hospital: {
+        name: string;
+        location: { lat: number; lng: number };
+        phone: string;
+    }
+): Promise<void> {
+    const hospitalMapLink = `https://www.google.com/maps?q=${hospital.location.lat},${hospital.location.lng}`;
+    const navigationLink = `https://www.google.com/maps/dir/?api=1&destination=${hospital.location.lat},${hospital.location.lng}`;
+
+    const body = [
+        `🏥 HOSPITAL UPDATE — RescuEdge`,
+        `Your contact is being transported to:`,
+        `${hospital.name}`,
+        `📍 Hospital Location: ${hospitalMapLink}`,
+        `🧭 Navigate: ${navigationLink}`,
+        `📞 Hospital Phone: ${hospital.phone}`,
+        `Case ID: ${accidentId}`,
+        `Please head to the hospital.`,
+    ].join('\n');
+
     await Promise.allSettled(contacts.map((contact) => sendSMS(contact, body)));
 }

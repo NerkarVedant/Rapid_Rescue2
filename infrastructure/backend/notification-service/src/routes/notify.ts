@@ -16,7 +16,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import { sendFCMNotification, sendMulticastFCM } from '../services/fcmService';
-import { sendEmergencySMS } from '../services/smsService';
+import { sendEmergencySMS, sendHospitalRoutingSMS } from '../services/smsService';
 import {
     findNearestResponders,
     registerResponder,
@@ -137,6 +137,44 @@ notifyRouter.post('/availability', (req: Request, res: Response) => {
 // ── GET /api/notify/responders ─────────────────────────────────
 notifyRouter.get('/responders', (_req: Request, res: Response) => {
     res.json({ payload: getAllResponders() });
+});
+
+// ── POST /api/notify/hospital-routing ─────────────────────────
+// Called when ambulance starts routing to hospital — sends SMS
+// with clickable hospital location link to emergency contacts.
+notifyRouter.post('/hospital-routing', async (req: Request, res: Response) => {
+    const { accidentId, hospital, emergencyContacts } = req.body ?? {};
+
+    if (!accidentId || !hospital?.name || !hospital?.location || !hospital?.phone) {
+        res.status(400).json({ error: 'accidentId, hospital (name, location, phone) required' });
+        return;
+    }
+
+    const contacts = (emergencyContacts ?? []).filter((c: string) =>
+        /^\+?[1-9]\d{6,14}$/.test(c.replace(/[\s\-()]/g, ''))
+    );
+
+    const results = { accidentId, smsDelivered: 0, hospital: hospital.name };
+
+    try {
+        if (contacts.length > 0) {
+            await sendHospitalRoutingSMS(contacts, accidentId, hospital);
+            results.smsDelivered = contacts.length;
+        }
+    } catch (err) {
+        console.error('[notification-service] Hospital routing SMS error:', err);
+    }
+
+    console.log(`[notification-service] Hospital routing SMS dispatched: ${JSON.stringify(results)}`);
+    res.json({
+        meta: {
+            requestId: `REQ-${uuidv4()}`,
+            timestamp: new Date().toISOString(),
+            env: process.env.NODE_ENV ?? 'development',
+            version: '1.0',
+        },
+        payload: results,
+    });
 });
 
 // ── POST /api/notify/test ─────────────────────────────────────
